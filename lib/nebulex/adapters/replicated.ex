@@ -611,6 +611,10 @@ defmodule Nebulex.Adapters.Replicated do
         # Remote node is down and maybe the "Process Groups" is not updated yet
         {acc1, [{node, :noconnection} | acc2]}
 
+      {{:error, {:exception, :badarg, _stacktrace}}, node}, {acc1, acc2} ->
+        # The ETS table may be stale if the remote cache is restarting
+        {acc1, [{node, :badarg} | acc2]}
+
       error, {acc1, acc2} ->
         {[error | acc1], acc2}
     end)
