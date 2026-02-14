@@ -331,6 +331,11 @@ defmodule Nebulex.Adapters.Replicated do
     # Maybe use stats
     stats = get_boolean_option(opts, :stats)
 
+    # Blocking mode (default: true). When false, the bootstrap process
+    # will not acquire a global lock, allowing write operations on other
+    # nodes to proceed without blocking during synchronization.
+    blocking = Keyword.get(opts, :blocking, true)
+
     # Primary cache options
     primary_opts =
       Keyword.merge(
@@ -354,7 +359,8 @@ defmodule Nebulex.Adapters.Replicated do
       name: name,
       primary_name: primary_opts[:name],
       task_sup: task_sup_name,
-      stats: stats
+      stats: stats,
+      blocking: blocking
     }
 
     # Prepare child_spec
@@ -535,33 +541,30 @@ defmodule Nebulex.Adapters.Replicated do
     do_with_transaction(adapter_meta, action, keys, args, opts, 1)
   end
 
-  defp do_with_transaction(%{name: name} = adapter_meta, action, keys, args, opts, times) do
-    # This is a bit hacky because the `:global_locks` table managed by
-    # `:global` is being accessed directly breaking the encapsulation.
-    # So far, this has been the simplest and fastest way to validate if
-    # the global sync lock `:"$sync_lock"` is set, so we block write-like
-    # operations until it finishes. The other option would be trying to
-    # lock the same key `:"$sync_lock"`, and then when the lock is acquired,
-    # delete it before processing the write operation. But this means another
-    # global lock across the cluster every time there is a write. So for the
-    # time being, we just read the global table to validate it which is much
-    # faster; since it is a local read with the global ETS, there is no global
-    # locks across the cluster.
-    case :ets.lookup(:global_locks, :"$sync_lock") do
-      [_] ->
-        :ok = random_sleep(times)
+  defp do_with_transaction(%{name: name, blocking: blocking} = adapter_meta, action, keys, args, opts, times) do
+    # When blocking mode is enabled, check if the global sync lock is set
+    # and block write-like operations until it finishes.
+    if blocking do
+      case :ets.lookup(:global_locks, :"$sync_lock") do
+        [_] ->
+          :ok = random_sleep(times)
 
-        do_with_transaction(adapter_meta, action, keys, args, opts, times + 1)
+          do_with_transaction(adapter_meta, action, keys, args, opts, times + 1)
 
-      [] ->
-        nodes = Cluster.get_nodes(name)
-
-        # Write-like operation must be wrapped within a transaction
-        # to ensure proper replication
-        transaction(adapter_meta, [keys: keys, nodes: nodes], fn ->
-          multi_call(adapter_meta, action, args, opts)
-        end)
+        [] ->
+          do_replicated_write(adapter_meta, name, action, keys, args, opts)
+      end
+    else
+      do_replicated_write(adapter_meta, name, action, keys, args, opts)
     end
+  end
+
+  defp do_replicated_write(adapter_meta, name, action, keys, args, opts) do
+    nodes = Cluster.get_nodes(name)
+
+    transaction(adapter_meta, [keys: keys, nodes: nodes], fn ->
+      multi_call(adapter_meta, action, args, opts)
+    end)
   end
 
   defp multi_call(%{name: name, task_sup: task_sup} = meta, action, args, opts) do
@@ -691,7 +694,9 @@ defmodule Nebulex.Adapters.Replicated.Bootstrap do
 
     # Set a global lock to stop any write operation
     # until the synchronization process finishes
-    :ok = lock(adapter_meta.name)
+    if Map.get(adapter_meta, :blocking, true) do
+      :ok = lock(adapter_meta.name)
+    end
 
     # Init retries
     state = Map.put(adapter_meta, :retries, 0)
@@ -706,7 +711,9 @@ defmodule Nebulex.Adapters.Replicated.Bootstrap do
     :ok = sync_data(state)
 
     # Delete global lock set when the server started
-    :ok = unlock(state.name)
+    if Map.get(state, :blocking, true) do
+      :ok = unlock(state.name)
+    end
 
     # Bootstrap process finished
     {:noreply, state}
